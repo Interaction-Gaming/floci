@@ -20,7 +20,8 @@ class S3IntegrationTest {
         .when()
             .put("/test-bucket")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .header("Location", equalTo("/test-bucket"));
     }
 
     @Test
@@ -50,6 +51,8 @@ class S3IntegrationTest {
     void putObject() {
         given()
             .contentType("text/plain")
+            .header("x-amz-meta-owner", "team-a")
+            .header("x-amz-storage-class", "STANDARD_IA")
             .body("Hello World from S3!")
         .when()
             .put("/test-bucket/greeting.txt")
@@ -68,11 +71,29 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("ETag", notNullValue())
             .header("Content-Length", notNullValue())
+            .header("x-amz-meta-owner", equalTo("team-a"))
+            .header("x-amz-storage-class", equalTo("STANDARD_IA"))
+            .header("x-amz-checksum-sha256", notNullValue())
             .body(equalTo("Hello World from S3!"));
     }
 
     @Test
     @Order(6)
+    void getObjectAttributes() {
+        given()
+            .header("x-amz-object-attributes", "ETag,ObjectSize,StorageClass,Checksum")
+        .when()
+            .get("/test-bucket/greeting.txt?attributes")
+        .then()
+            .statusCode(200)
+            .body(containsString("<GetObjectAttributesResponse"))
+            .body(containsString("<StorageClass>STANDARD_IA</StorageClass>"))
+            .body(containsString("<ObjectSize>20</ObjectSize>"))
+            .body(containsString("<ChecksumSHA256>"));
+    }
+
+    @Test
+    @Order(7)
     void headObject() {
         given()
         .when()
@@ -80,11 +101,14 @@ class S3IntegrationTest {
         .then()
             .statusCode(200)
             .header("ETag", notNullValue())
-            .header("Content-Length", notNullValue());
+            .header("Content-Length", notNullValue())
+            .header("x-amz-meta-owner", equalTo("team-a"))
+            .header("x-amz-storage-class", equalTo("STANDARD_IA"))
+            .header("x-amz-checksum-sha256", notNullValue());
     }
 
     @Test
-    @Order(7)
+    @Order(8)
     void getObjectNotFound() {
         given()
         .when()
@@ -95,7 +119,7 @@ class S3IntegrationTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     void putAnotherObject() {
         given()
             .contentType("application/json")
@@ -107,7 +131,7 @@ class S3IntegrationTest {
     }
 
     @Test
-    @Order(9)
+    @Order(10)
     void listObjects() {
         given()
         .when()
@@ -119,7 +143,7 @@ class S3IntegrationTest {
     }
 
     @Test
-    @Order(10)
+    @Order(11)
     void listObjectsWithPrefix() {
         given()
             .queryParam("prefix", "data/")
@@ -132,10 +156,14 @@ class S3IntegrationTest {
     }
 
     @Test
-    @Order(11)
+    @Order(12)
     void copyObject() {
         given()
             .header("x-amz-copy-source", "/test-bucket/greeting.txt")
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header("x-amz-meta-owner", "team-b")
+            .header("x-amz-storage-class", "GLACIER")
+            .contentType("application/json")
         .when()
             .put("/test-bucket/greeting-copy.txt")
         .then()
@@ -148,11 +176,13 @@ class S3IntegrationTest {
             .get("/test-bucket/greeting-copy.txt")
         .then()
             .statusCode(200)
+            .header("x-amz-meta-owner", equalTo("team-b"))
+            .header("x-amz-storage-class", equalTo("GLACIER"))
             .body(equalTo("Hello World from S3!"));
     }
 
     @Test
-    @Order(12)
+    @Order(13)
     void deleteObject() {
         given()
         .when()
@@ -169,7 +199,7 @@ class S3IntegrationTest {
     }
 
     @Test
-    @Order(13)
+    @Order(14)
     void deleteNonEmptyBucketFails() {
         given()
         .when()
@@ -180,7 +210,7 @@ class S3IntegrationTest {
     }
 
     @Test
-    @Order(14)
+    @Order(16)
     void cleanupAndDeleteBucket() {
         // Delete all objects
         given().delete("/test-bucket/greeting.txt");
@@ -195,6 +225,18 @@ class S3IntegrationTest {
     }
 
     @Test
+    @Order(15)
+    void getObjectAttributesRejectsUnknownSelector() {
+        given()
+            .header("x-amz-object-attributes", "ETag,UnknownThing")
+        .when()
+            .get("/test-bucket/greeting.txt?attributes")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"));
+    }
+
+    @Test
     void getNonExistentBucket() {
         given()
         .when()
@@ -202,5 +244,85 @@ class S3IntegrationTest {
         .then()
             .statusCode(404)
             .body(containsString("NoSuchBucket"));
+    }
+
+    @Test
+    @Order(17)
+    void headBucketReturnsStoredRegionForLocationConstraintBucket() {
+        String bucket = "eu-head-bucket";
+        String createBucketConfiguration = """
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <LocationConstraint>eu-central-1</LocationConstraint>
+                </CreateBucketConfiguration>
+                """;
+
+        given()
+            .contentType("application/xml")
+            .body(createBucketConfiguration)
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200)
+            .header("Location", equalTo("/" + bucket));
+
+        given()
+        .when()
+            .head("/" + bucket)
+        .then()
+            .statusCode(200)
+            .header("x-amz-bucket-region", equalTo("eu-central-1"));
+
+        given()
+        .when()
+            .delete("/" + bucket)
+        .then()
+            .statusCode(204);
+    }
+
+    @Test
+    @Order(18)
+    void createBucketUsesSigningRegionWhenBodyEmpty() {
+        String bucket = "signed-region-bucket";
+
+        given()
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260325/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=test")
+        .when()
+            .put("/" + bucket)
+        .then()
+            .statusCode(200)
+            .header("Location", equalTo("/" + bucket));
+
+        given()
+        .when()
+            .head("/" + bucket)
+        .then()
+            .statusCode(200)
+            .header("x-amz-bucket-region", equalTo("eu-west-1"));
+
+        given()
+        .when()
+            .delete("/" + bucket)
+        .then()
+            .statusCode(204);
+    }
+
+    @Test
+    @Order(19)
+    void createBucketRejectsUsEast1LocationConstraint() {
+        String createBucketConfiguration = """
+                <CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <LocationConstraint>us-east-1</LocationConstraint>
+                </CreateBucketConfiguration>
+                """;
+
+        given()
+            .contentType("application/xml")
+            .body(createBucketConfiguration)
+        .when()
+            .put("/invalid-location-bucket")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidLocationConstraint"));
     }
 }

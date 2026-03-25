@@ -6,10 +6,15 @@ import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
+import io.github.hectorvent.floci.services.s3.model.GetObjectAttributesParts;
+import io.github.hectorvent.floci.services.s3.model.GetObjectAttributesResult;
 import io.github.hectorvent.floci.services.s3.model.MultipartUpload;
 import io.github.hectorvent.floci.services.s3.model.NotificationConfiguration;
+import io.github.hectorvent.floci.services.s3.model.ObjectAttributeName;
 import io.github.hectorvent.floci.services.s3.model.QueueNotification;
 import io.github.hectorvent.floci.services.s3.model.ObjectLockRetention;
+import io.github.hectorvent.floci.services.s3.model.Part;
+import io.github.hectorvent.floci.services.s3.model.S3Checksum;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.TopicNotification;
 import jakarta.inject.Inject;
@@ -24,9 +29,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import org.jboss.logging.Logger;
 
@@ -91,8 +98,12 @@ public class S3Controller {
     public Response headBucket(@PathParam("bucket") String bucket) {
         try {
             s3Service.headBucket(bucket);
+            String bucketRegion = s3Service.getBucketRegion(bucket);
+            if (bucketRegion == null || bucketRegion.isBlank()) {
+                bucketRegion = regionResolver.getDefaultRegion();
+            }
             return Response.ok()
-                    .header("x-amz-bucket-region", regionResolver.getDefaultRegion())
+                    .header("x-amz-bucket-region", bucketRegion)
                     .build();
         } catch (AwsException e) {
             return Response.status(e.getHttpStatus()).build();
@@ -139,13 +150,30 @@ public class S3Controller {
                 return Response.ok().build();
             }
 
-            s3Service.createBucket(bucket);
+            String locationConstraint = null;
+            if (body != null && body.length > 0) {
+                locationConstraint = XmlParser.extractFirst(new String(body, StandardCharsets.UTF_8),
+                        "LocationConstraint", null);
+            }
+            if (locationConstraint != null) {
+                locationConstraint = locationConstraint.trim();
+                if (locationConstraint.isEmpty()) {
+                    locationConstraint = null;
+                } else if ("us-east-1".equalsIgnoreCase(locationConstraint)) {
+                    throw new AwsException("InvalidLocationConstraint",
+                            "The specified location-constraint is not valid.", 400);
+                }
+            }
+            String region = locationConstraint != null ? locationConstraint : regionResolver.resolveRegion(httpHeaders);
+            s3Service.createBucket(bucket, region);
             String lockEnabled = httpHeaders.getHeaderString("x-amz-bucket-object-lock-enabled");
             if ("true".equalsIgnoreCase(lockEnabled)) {
                 s3Service.putBucketVersioning(bucket, "Enabled");
                 s3Service.setBucketObjectLockEnabled(bucket);
             }
-            return Response.ok().build();
+            return Response.ok()
+                    .header("Location", "/" + bucket)
+                    .build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
         }
@@ -253,7 +281,7 @@ public class S3Controller {
                    .elem("LastModified", ISO_FORMAT.format(obj.getLastModified()))
                    .elem("ETag", obj.getETag())
                    .elem("Size", obj.getSize())
-                   .elem("StorageClass", "STANDARD")
+                   .elem("StorageClass", obj.getStorageClass())
                    .end("Contents");
             }
             xml.end("ListBucketResult");
@@ -298,12 +326,13 @@ public class S3Controller {
 
             if (uploadId != null && partNumber != null) {
                 byte[] partData = decodeAwsChunked(body, contentEncoding, contentSha256);
+                validateChecksumHeaders(httpHeaders, partData);
                 String eTag = s3Service.uploadPart(bucket, key, uploadId, partNumber, partData);
                 return Response.ok().header("ETag", eTag).build();
             }
 
             if (copySource != null && !copySource.isEmpty()) {
-                return handleCopyObject(copySource, bucket, key);
+                return handleCopyObject(copySource, bucket, key, contentType, httpHeaders);
             }
 
             String lockMode = httpHeaders.getHeaderString("x-amz-object-lock-mode");
@@ -312,12 +341,15 @@ public class S3Controller {
             Instant retainUntil = retainUntilStr != null ? Instant.parse(retainUntilStr) : null;
 
             byte[] data = decodeAwsChunked(body, contentEncoding, contentSha256);
-            S3Object obj = s3Service.putObject(bucket, key, data, contentType, null,
+            validateChecksumHeaders(httpHeaders, data);
+            S3Object obj = s3Service.putObject(bucket, key, data, contentType, extractUserMetadata(httpHeaders),
+                    httpHeaders.getHeaderString("x-amz-storage-class"),
                     lockMode, retainUntil, legalHold);
             var resp = Response.ok().header("ETag", obj.getETag());
             if (obj.getVersionId() != null) {
                 resp.header("x-amz-version-id", obj.getVersionId());
             }
+            appendObjectHeaders(resp, obj);
             return resp.build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
@@ -329,6 +361,9 @@ public class S3Controller {
     public Response getObject(@PathParam("bucket") String bucket,
                               @PathParam("key") String key,
                               @QueryParam("versionId") String versionId,
+                              @HeaderParam("x-amz-object-attributes") String objectAttributesHeader,
+                              @HeaderParam("x-amz-max-parts") Integer maxParts,
+                              @HeaderParam("x-amz-part-number-marker") Integer partNumberMarker,
                               @Context UriInfo uriInfo) {
         try {
             if (hasQueryParam(uriInfo, "tagging")) {
@@ -343,6 +378,10 @@ public class S3Controller {
             if (hasQueryParam(uriInfo, "acl")) {
                 return Response.ok(s3Service.getObjectAcl(bucket, key, versionId)).build();
             }
+            if (hasQueryParam(uriInfo, "attributes")) {
+                return handleGetObjectAttributes(bucket, key, versionId,
+                        objectAttributesHeader, maxParts, partNumberMarker);
+            }
             S3Object obj = s3Service.getObject(bucket, key, versionId);
             var resp = Response.ok(obj.getData())
                     .header("Content-Type", obj.getContentType())
@@ -352,7 +391,7 @@ public class S3Controller {
             if (obj.getVersionId() != null) {
                 resp.header("x-amz-version-id", obj.getVersionId());
             }
-            appendLockHeaders(resp, obj);
+            appendObjectHeaders(resp, obj);
             return resp.build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
@@ -374,7 +413,7 @@ public class S3Controller {
             if (obj.getVersionId() != null) {
                 resp.header("x-amz-version-id", obj.getVersionId());
             }
-            appendLockHeaders(resp, obj);
+            appendObjectHeaders(resp, obj);
             return resp.build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
@@ -439,11 +478,13 @@ public class S3Controller {
                                          @QueryParam("uploadId") String uploadId,
                                          @QueryParam("versionId") String versionId,
                                          @HeaderParam("Content-Type") String contentType,
+                                         @Context HttpHeaders httpHeaders,
                                          @Context UriInfo uriInfo,
                                          byte[] body) {
         try {
             if (hasQueryParam(uriInfo, "uploads")) {
-                MultipartUpload upload = s3Service.initiateMultipartUpload(bucket, key, contentType);
+                MultipartUpload upload = s3Service.initiateMultipartUpload(bucket, key, contentType,
+                        extractUserMetadata(httpHeaders), httpHeaders.getHeaderString("x-amz-storage-class"));
                 String xml = new XmlBuilder()
                         .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                         .start("InitiateMultipartUploadResult", AwsNamespaces.S3)
@@ -475,16 +516,22 @@ public class S3Controller {
                 if (baseUrl.endsWith("/")) {
                     baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
                 }
-                String xml = new XmlBuilder()
+                XmlBuilder xmlBuilder = new XmlBuilder()
                         .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                         .start("CompleteMultipartUploadResult", AwsNamespaces.S3)
                         .elem("Location", baseUrl + "/" + bucket + "/" + key)
                         .elem("Bucket", bucket)
                         .elem("Key", key)
-                        .elem("ETag", obj.getETag())
-                        .end("CompleteMultipartUploadResult")
-                        .build();
-                return Response.ok(xml).build();
+                        .elem("ETag", obj.getETag());
+                if (obj.getVersionId() != null) {
+                    xmlBuilder.elem("VersionId", obj.getVersionId());
+                }
+                String xml = xmlBuilder.end("CompleteMultipartUploadResult").build();
+                var resp = Response.ok(xml);
+                if (obj.getVersionId() != null) {
+                    resp.header("x-amz-version-id", obj.getVersionId());
+                }
+                return resp.build();
             }
 
             return xmlErrorResponse(new AwsException("InvalidArgument",
@@ -602,7 +649,7 @@ public class S3Controller {
                    .elem("LastModified", ISO_FORMAT.format(obj.getLastModified()))
                    .elem("ETag", obj.getETag())
                    .elem("Size", obj.getSize())
-                   .elem("StorageClass", "STANDARD")
+                   .elem("StorageClass", obj.getStorageClass())
                    .end("Version");
             }
         }
@@ -721,8 +768,10 @@ public class S3Controller {
     // --- Bucket Location ---
 
     private Response handleGetBucketLocation(String bucket) {
-        s3Service.headBucket(bucket);
-        String region = regionResolver.getDefaultRegion();
+        String region = s3Service.getBucketRegion(bucket);
+        if (region == null) {
+            region = regionResolver.getDefaultRegion();
+        }
         String xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("LocationConstraint", AwsNamespaces.S3)
@@ -868,6 +917,19 @@ public class S3Controller {
         return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
     }
 
+    private void appendObjectHeaders(Response.ResponseBuilder resp, S3Object obj) {
+        if (obj.getStorageClass() != null) {
+            resp.header("x-amz-storage-class", obj.getStorageClass());
+        }
+        if (obj.getMetadata() != null) {
+            for (Map.Entry<String, String> entry : obj.getMetadata().entrySet()) {
+                resp.header("x-amz-meta-" + entry.getKey(), entry.getValue());
+            }
+        }
+        appendChecksumHeaders(resp, obj.getChecksum());
+        appendLockHeaders(resp, obj);
+    }
+
     private void appendLockHeaders(Response.ResponseBuilder resp, S3Object obj) {
         if (obj.getObjectLockMode() != null) {
             resp.header("x-amz-object-lock-mode", obj.getObjectLockMode());
@@ -883,7 +945,8 @@ public class S3Controller {
 
     // --- Helpers ---
 
-    private Response handleCopyObject(String copySource, String destBucket, String destKey) {
+    private Response handleCopyObject(String copySource, String destBucket, String destKey,
+                                      String contentType, HttpHeaders httpHeaders) {
         String source = copySource.startsWith("/") ? copySource.substring(1) : copySource;
         int slashIndex = source.indexOf('/');
         if (slashIndex < 0) {
@@ -892,7 +955,11 @@ public class S3Controller {
         String sourceBucket = source.substring(0, slashIndex);
         String sourceKey = source.substring(slashIndex + 1);
 
-        S3Object copy = s3Service.copyObject(sourceBucket, sourceKey, destBucket, destKey);
+        S3Object copy = s3Service.copyObject(sourceBucket, sourceKey, destBucket, destKey,
+                httpHeaders.getHeaderString("x-amz-metadata-directive"),
+                extractUserMetadata(httpHeaders),
+                httpHeaders.getHeaderString("x-amz-storage-class"),
+                contentType);
         String xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("CopyObjectResult", AwsNamespaces.S3)
@@ -901,6 +968,114 @@ public class S3Controller {
                 .end("CopyObjectResult")
                 .build();
         return Response.ok(xml).build();
+    }
+
+    private Response handleGetObjectAttributes(String bucket, String key, String versionId,
+                                               String objectAttributesHeader, Integer maxParts,
+                                               Integer partNumberMarker) {
+        Set<ObjectAttributeName> attributes = ObjectAttributeName.parseHeader(objectAttributesHeader);
+        GetObjectAttributesResult result = s3Service.getObjectAttributes(bucket, key, versionId,
+                attributes, maxParts, partNumberMarker);
+
+        XmlBuilder xml = new XmlBuilder()
+                .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                .start("GetObjectAttributesResponse", AwsNamespaces.S3)
+                .elem("ETag", result.getETag());
+        appendChecksum(xml, result.getChecksum());
+        appendObjectParts(xml, result.getObjectParts());
+        if (result.getStorageClass() != null) {
+            xml.elem("StorageClass", result.getStorageClass());
+        }
+        if (result.getObjectSize() != null) {
+            xml.elem("ObjectSize", result.getObjectSize());
+        }
+        xml.end("GetObjectAttributesResponse");
+
+        Response.ResponseBuilder response = Response.ok(xml.build()).type(MediaType.APPLICATION_XML);
+        if (result.getLastModified() != null) {
+            response.header("Last-Modified", RFC_822.format(result.getLastModified()));
+        }
+        if (result.getVersionId() != null) {
+            response.header("x-amz-version-id", result.getVersionId());
+        }
+        return response.build();
+    }
+
+    private void appendChecksum(XmlBuilder xml, S3Checksum checksum) {
+        if (checksum == null || !checksum.hasAnyValue()) {
+            return;
+        }
+        xml.start("Checksum")
+                .elem("ChecksumCRC32", checksum.getChecksumCRC32())
+                .elem("ChecksumCRC32C", checksum.getChecksumCRC32C())
+                .elem("ChecksumCRC64NVME", checksum.getChecksumCRC64NVME())
+                .elem("ChecksumSHA1", checksum.getChecksumSHA1())
+                .elem("ChecksumSHA256", checksum.getChecksumSHA256())
+                .elem("ChecksumType", checksum.getChecksumType())
+                .end("Checksum");
+    }
+
+    private void appendObjectParts(XmlBuilder xml, GetObjectAttributesParts objectParts) {
+        if (objectParts == null) {
+            return;
+        }
+        xml.start("ObjectParts")
+                .elem("IsTruncated", objectParts.isTruncated())
+                .elem("MaxParts", objectParts.getMaxParts())
+                .elem("NextPartNumberMarker", objectParts.getNextPartNumberMarker())
+                .elem("PartNumberMarker", objectParts.getPartNumberMarker());
+        for (Part part : objectParts.getParts()) {
+            xml.start("Part")
+                    .elem("ChecksumCRC32", part.getChecksum().getChecksumCRC32())
+                    .elem("ChecksumCRC32C", part.getChecksum().getChecksumCRC32C())
+                    .elem("ChecksumCRC64NVME", part.getChecksum().getChecksumCRC64NVME())
+                    .elem("ChecksumSHA1", part.getChecksum().getChecksumSHA1())
+                    .elem("ChecksumSHA256", part.getChecksum().getChecksumSHA256())
+                    .elem("PartNumber", part.getPartNumber())
+                    .elem("Size", part.getSize())
+                    .end("Part");
+        }
+        xml.elem("PartsCount", objectParts.getPartsCount())
+                .end("ObjectParts");
+    }
+
+    private void appendChecksumHeaders(Response.ResponseBuilder resp, S3Checksum checksum) {
+        if (checksum == null) {
+            return;
+        }
+        if (checksum.getChecksumSHA1() != null) {
+            resp.header("x-amz-checksum-sha1", checksum.getChecksumSHA1());
+        }
+        if (checksum.getChecksumSHA256() != null) {
+            resp.header("x-amz-checksum-sha256", checksum.getChecksumSHA256());
+        }
+    }
+
+    private Map<String, String> extractUserMetadata(HttpHeaders httpHeaders) {
+        Map<String, String> metadata = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> entry : httpHeaders.getRequestHeaders().entrySet()) {
+            String headerName = entry.getKey().toLowerCase(Locale.ROOT);
+            if (!headerName.startsWith("x-amz-meta-")) {
+                continue;
+            }
+            String key = headerName.substring("x-amz-meta-".length());
+            if (!key.isBlank() && !entry.getValue().isEmpty()) {
+                metadata.put(key, entry.getValue().get(0));
+            }
+        }
+        return metadata;
+    }
+
+    private void validateChecksumHeaders(HttpHeaders httpHeaders, byte[] data) {
+        String sha1 = httpHeaders.getHeaderString("x-amz-checksum-sha1");
+        if (sha1 != null && !sha1.equals(S3Checksum.sha1Base64(data))) {
+            throw new AwsException("BadDigest", "The SHA1 checksum you specified did not match the payload.", 400);
+        }
+
+        String sha256 = httpHeaders.getHeaderString("x-amz-checksum-sha256");
+        if (sha256 != null && !sha256.equals(S3Checksum.sha256Base64(data))) {
+            throw new AwsException("BadDigest", "The SHA256 checksum you specified did not match the payload.", 400);
+        }
     }
 
     private Response xmlErrorResponse(AwsException e) {

@@ -6,11 +6,11 @@
 
     <groupId>io.github.hectorvent</groupId>
     <artifactId>floci</artifactId>
-    <version>1.0.4</version>
+    <version>1.0.11</version>
     <packaging>jar</packaging>
 
     <name>Floci</name>
-    <description>Fast, free, open-source local AWS emulator supporting SSM, SQS, SNS, S3, DynamoDB, Lambda, API Gateway, Cognito, KMS, Kinesis, Secrets Manager, CloudFormation, Step Functions, IAM, STS, ElastiCache, RDS, EventBridge, and CloudWatch</description>
+    <description>Fast, free, open-source local AWS emulator supporting SSM, SQS, SNS, SES, S3, DynamoDB, Lambda, API Gateway, Cognito, KMS, Kinesis, Secrets Manager, CloudFormation, Step Functions, IAM, STS, ElastiCache, RDS, EventBridge, and CloudWatch</description>
 
     <properties>
         <maven.compiler.release>25</maven.compiler.release>
@@ -81,6 +81,18 @@
             <groupId>com.github.docker-java</groupId>
             <artifactId>docker-java-transport-httpclient5</artifactId>
             <version>3.4.0</version>
+        </dependency>
+
+        <!-- BouncyCastle for X.509 certificate generation and PEM handling (ACM service) -->
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk18on</artifactId>
+            <version>1.83</version>
+        </dependency>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk18on</artifactId>
+            <version>1.83</version>
         </dependency>
 
         <!-- Testing -->

@@ -44,6 +44,7 @@ public interface EmulatorConfig {
         CloudWatchLogsStorageConfig cloudwatchlogs();
         CloudWatchMetricsStorageConfig cloudwatchmetrics();
         SecretsManagerStorageConfig secretsmanager();
+        AcmStorageConfig acm();
     }
 
     interface SsmStorageConfig {
@@ -112,6 +113,14 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface AcmStorageConfig {
+        @WithDefault("memory")
+        String mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface WalConfig {
         @WithDefault("30000")
         long compactionIntervalMs();
@@ -150,6 +159,8 @@ public interface EmulatorConfig {
         CognitoServiceConfig cognito();
         StepFunctionsServiceConfig stepfunctions();
         CloudFormationServiceConfig cloudformation();
+        AcmServiceConfig acm();
+        SesServiceConfig ses();
     }
 
     interface SsmServiceConfig {
@@ -291,6 +302,20 @@ public interface EmulatorConfig {
     }
 
     interface CloudFormationServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AcmServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Seconds to wait before transitioning from PENDING_VALIDATION to ISSUED (0 = immediate) */
+        @WithDefault("0")
+        int validationWaitSeconds();
+    }
+
+    interface SesServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
